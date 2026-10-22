@@ -798,9 +798,6 @@ ELT rebuilds staging from raw every run, so it can't drift like this. The ETL ne
 | What | File |
 |---|---|
 | Schedule showing 9:00 AM IST and the next-run time | [ScheduleScreenShot.png](ScheduleScreenShot.png) |
-| ETL DAG, Graph view, green run (`final2_full`) | `screenshots/etl_graph.png` |
-| ELT DAG, Graph view, green run (`final_full`) | `screenshots/elt_graph.png` |
-| A quarantine file (`include/quarantine/rahul/orders_failed_final2_full.csv`) | `screenshots/quarantine_file.png` |
-| `dq_results` query result | `screenshots/dq_results.png` |
-| `pipeline_runs` query result | `screenshots/pipeline_runs.png` |
-| Payment reconciliation table (`etl_payment_reconciliation` / `mart_payment_reconciliation`) | `screenshots/reconciliation.png` |
+| ETL DAG, Graph view, green run (`final2_full`) | `screenshots/Results.png` |
+| ELT DAG, Graph view, green run (`final_full`) | `screenshots/Results.png` |
+
