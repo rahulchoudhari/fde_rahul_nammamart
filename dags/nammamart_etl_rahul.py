@@ -99,6 +99,15 @@ def nammamart_etl_rahul():
             history = pd.read_csv(f"{DATA_DIR}/orders.csv", dtype=str, keep_default_na=False, na_values=[""])
             ctx["orders"] = pd.concat([raw["orders"], history], ignore_index=True)
 
+        # Volume baseline: row counts of the last 5 loads of this same orders file
+        con = connect()
+        con.execute("""CREATE TABLE IF NOT EXISTS etl_load_history
+                       (run_id VARCHAR, file VARCHAR, rows BIGINT, loaded_at TIMESTAMPTZ)""")
+        ctx["orders_history_rows"] = [r[0] for r in con.execute(
+            "SELECT rows FROM etl_load_history WHERE file = ? ORDER BY loaded_at DESC LIMIT 5",
+            [files["orders"]]).fetchall()]
+        con.close()
+
         os.makedirs(QUARANTINE_DIR, exist_ok=True)
         all_results, passed_paths, counts = [], {}, {}
 
@@ -132,9 +141,20 @@ def nammamart_etl_rahul():
         con = connect()
         con.execute("CREATE TABLE IF NOT EXISTS dq_results AS SELECT * FROM dq LIMIT 0")
         con.execute("INSERT INTO dq_results SELECT * FROM dq")
+        for e in extracted:
+            con.execute("INSERT INTO etl_load_history VALUES (?, ?, ?, now())",
+                        [context["run_id"], e["file"], e["rows"]])
         con.close()
 
-        return {"passed": passed_paths, "counts": counts}
+        # Order IDs whose fact rows this run replaces. A full file replaces every order in it,
+        # so an order that now fails its checks is removed from the fact instead of going stale.
+        # An increment only replaces orders that passed, so a bad correction never deletes a good row.
+        is_full = files["orders"] == "orders.csv"
+        ids = raw["orders"] if is_full else pd.read_pickle(passed_paths["orders"])
+        replace_ids_path = _work_path("replace_ids")
+        ids[["order_id"]].dropna().drop_duplicates().to_pickle(replace_ids_path)
+
+        return {"passed": passed_paths, "counts": counts, "replace_ids": replace_ids_path}
 
     # ── TRANSFORM: clean, mask PII, build the star schema ─────────────────────
 
@@ -171,6 +191,7 @@ def nammamart_etl_rahul():
                          "dim_store": stores, "payments": payments}.items():
             out[name] = _work_path(f"clean_{name}")
             df.to_pickle(out[name])
+        out["replace_ids"] = validated["replace_ids"]
         return out
 
     # ── LOAD: idempotent writes to DuckDB ─────────────────────────────────────
@@ -189,22 +210,28 @@ def nammamart_etl_rahul():
             print(f"[Load] etl_{name}: {len(df)} rows")
 
         # Fact: delete-then-insert by order_id in one transaction.
-        # Re-runs replace the same rows; increment corrections overwrite the old version.
+        # Re-runs replace the same rows; increment corrections overwrite the old version;
+        # orders in a full file that now fail their checks are removed (see validate).
         fact = pd.read_pickle(transformed["fact_orders"])
+        replace_ids = pd.read_pickle(transformed["replace_ids"])
         con.execute("CREATE TABLE IF NOT EXISTS etl_fact_orders AS SELECT * FROM fact LIMIT 0")
         before = con.execute("SELECT COUNT(*) FROM etl_fact_orders").fetchone()[0]
         con.execute("BEGIN")
         replaced = con.execute(
             "SELECT COUNT(*) FROM etl_fact_orders WHERE order_id IN (SELECT order_id FROM fact)"
         ).fetchone()[0]
-        con.execute("DELETE FROM etl_fact_orders WHERE order_id IN (SELECT order_id FROM fact)")
+        removed = con.execute("""
+            SELECT COUNT(*) FROM etl_fact_orders
+            WHERE order_id IN (SELECT order_id FROM replace_ids) AND order_id NOT IN (SELECT order_id FROM fact)
+        """).fetchone()[0]
+        con.execute("DELETE FROM etl_fact_orders WHERE order_id IN (SELECT order_id FROM replace_ids)")
         con.execute("INSERT INTO etl_fact_orders BY NAME SELECT * FROM fact")
         con.execute("COMMIT")
         after = con.execute("SELECT COUNT(*) FROM etl_fact_orders").fetchone()[0]
         con.close()
 
-        print(f"[Load] etl_fact_orders: {before} → {after} rows "
-              f"({len(fact) - replaced} inserted, {replaced} replaced/updated)")
+        print(f"[Load] etl_fact_orders: {before} → {after} rows ({len(fact) - replaced} inserted, "
+              f"{replaced} replaced/updated, {removed} removed because they now fail a check)")
         return len(fact)
 
     # ── RECONCILE: every order/payment mismatch, with a reason ────────────────
@@ -304,7 +331,7 @@ def nammamart_etl_rahul():
 
     # ── AUDIT: one row per run in pipeline_runs, even when something failed ───
 
-    @task(trigger_rule="all_done")
+    @task(trigger_rule="all_done", retries=0)    # retrying would write duplicate audit rows
     def audit():
         from rahul_warehouse import connect
         import pandas as pd

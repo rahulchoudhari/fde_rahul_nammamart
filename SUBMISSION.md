@@ -85,7 +85,66 @@ Nobody will answer these, so each question has the assumption my pipeline uses.
 
 ## Part A: ETL pipeline
 
+**DAG:** [`dags/nammamart_etl_rahul.py`](dags/nammamart_etl_rahul.py)
+**Helper code:** [`include/nammamart_dq.py`](include/nammamart_dq.py) (checks, cleaning, masking) and [`include/rahul_warehouse.py`](include/rahul_warehouse.py) (warehouse connection)
+**Warehouse:** `include/warehouse_rahul.duckdb`
+
+```
+extract[orders]    ──┐
+extract[payments]  ──┤
+extract[customers] ──┼──► validate ──► transform ──► load ──► reconcile ──► report ──► audit
+extract[products]  ──┤      │                                                          ▲
+extract[stores]    ──┘      └─► quarantine CSVs + dq_results               (all_done) ─┘
+```
+
+| Task | What it does |
+|---|---|
+| `extract` ×5 | One mapped task per file, all 5 running in parallel. Reads the CSV with every column as text (`dtype=str`), so the checks see values exactly as received. |
+| `validate` | Runs the 36 checks from Part D with `run_checks()`. Rows that fail any Critical check are written to `include/quarantine/rahul/<file>_failed_<run_id>.csv` with a `failure_reason` column. Customer emails and phones are masked even in quarantine. All results go to `dq_results`. |
+| `transform` | Cleans the passed rows: trims text, uppercases statuses, maps `upi`/`cod`/`Cashh` to the allowed modes, fixes tier casing. Masks email (`pr***@example.com`) and phone (`98******21`) and drops `full_name`. Joins orders to products for `cost_price`, then derives `order_date`, `net_revenue` (DELIVERED only), `gross_margin` and `within_15_min`. |
+| `load` | Writes a star schema. The dimensions (`etl_dim_customer`, `etl_dim_product`, `etl_dim_store`) and `etl_payments` are full snapshots, replaced each run. The fact `etl_fact_orders` uses **delete-then-insert by `order_id` in one transaction**, so a re-run replaces the same rows instead of adding them, and an increment correction overwrites the old row. |
+| `reconcile` | Builds `etl_payment_reconciliation`: one row per mismatch, with one of 4 reasons (`DELIVERED_NOT_PAID`, `AMOUNT_MISMATCH`, `CANCELLED_BUT_PAID`, `ORDER_NOT_IN_FACT`). |
+| `report` | Builds `etl_daily_zone_revenue` and `etl_category_margin` and prints them in the log. |
+| `audit` | `trigger_rule="all_done"`, so it runs even after a failure. It writes one row to `pipeline_runs`, then fails on purpose if the run failed, so the run stays red. |
+
+**Incremental load:** trigger with config `{"orders_file": "orders_2026-10-01_increment.csv"}`.
+
+**Results (September data):** 5,212 rows extracted, 141 quarantined (orders 100, payments 22, customers 8, products 10, stores 1), 2,312 orders in `etl_fact_orders`, September net revenue ₹11,35,628.60.
+
 ## Part B: ELT pipeline
+
+**DAG:** [`dags/nammamart_elt_rahul.py`](dags/nammamart_elt_rahul.py)
+**SQL:** [`include/sql/`](include/sql/), one file per staging table, per mart, plus setup, MERGE and dq_results.
+
+```
+extract ×5 ──► load_raw ──► build_staging ──► merge_increments ──► record_dq ──► build_marts ──► report ──► audit (all_done)
+```
+
+| Layer | Tables | How it's built |
+|---|---|---|
+| Raw | `raw_orders`, `raw_payments`, `raw_customers`, `raw_products`, `raw_stores` | DuckDB `read_csv(..., all_varchar = true)`: every column as text, no cleaning. Adds `_loaded_at`, `_source_file`, `_run_id` and `_source_row` (the row number in the file). **Append only**, never updated or deleted. |
+| Staging | `stg_orders`, `stg_payments`, `stg_customers`, `stg_products`, `stg_stores` | SQL only ([stg_*.sql](include/sql/)). Reads the latest load of each file, casts types with `TRY_CAST`/`TRY_STRPTIME`, standardises, dedupes, masks PII with the SQL macros `mask_email()`/`mask_phone()`, and drops `full_name`. Every row keeps one true/false column per check (`chk__<check_name>`), plus `dq_status` (PASSED/FAILED), `failure_reason` (Critical checks) and `dq_warnings`. |
+| Mart | `mart_daily_store_kpis`, `mart_category_margin`, `mart_delivery_sla`, `mart_payment_reconciliation`, `mart_top_customers`, plus `mart_payment_mode_revenue` (Q4) and `mart_rejected_rows` (Q6) | SQL only ([mart_*.sql](include/sql/)). Reads only `dq_status = 'PASSED'` rows. |
+
+`extract` doesn't read the data. It checks that each file exists and that its header matches the expected columns, so a schema change fails loudly before anything is loaded.
+
+**Incremental load** ([stg_orders_merge.sql](include/sql/stg_orders_merge.sql)):
+
+1. Raw: the increment file is appended to `raw_orders`, with `_source_file = 'orders_2026-10-01_increment.csv'`.
+2. Staging: `stg_orders` is rebuilt from `orders.csv`, then every increment file is merged into it:
+   ```sql
+   MERGE INTO stg_orders AS t USING (<checked increment rows>) AS s
+   ON t.order_id = s.order_id AND t.dq_status = 'PASSED'
+   WHEN MATCHED AND s.dq_status = 'PASSED' THEN UPDATE
+   WHEN NOT MATCHED THEN INSERT;
+   ```
+   Result: **150 orders inserted, 10 updated** (DELIVERED → RETURNED), no duplicates. Because the MERGE runs again after every staging rebuild, the corrections survive any later re-run.
+
+**Do ELT totals match ETL?** Yes. September net revenue is **₹11,35,628.60 in both**, with the same 141 rejected rows and the same zone and category numbers. The `report` task compares the two on every run and prints `MATCH`.
+
+The totals differed only once, by **₹4,193.70**, when the ELT had loaded the increment and the ETL hadn't yet. That's exactly the revenue of the 10 orders that became RETURNED. After the ETL loaded the increment too, they matched again.
+
+Matching needs identical rules in both pipelines. The same "now" time is used for the future-date checks, both pipelines keep the first copy of a duplicate, and both check product and store keys against the master file as received.
 
 ## Part C: Scheduling
 
@@ -157,11 +216,11 @@ In the code columns, `ts`, `qty`, `price`, `disc`, `amt`, `mins`, `paid`, `mrp` 
 
 | check_name | Dimension | Severity | ETL (pandas): row fails when… | ELT (SQL): row fails when… |
 |---|---|---|---|---|
-| `orders_order_id_unique` | Uniqueness | Critical | `df.order_id.duplicated(keep="first")` | `ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY _loaded_at) > 1` |
+| `orders_order_id_unique` | Uniqueness | Critical | `df.order_id.duplicated(keep="first")` | `ROW_NUMBER() OVER (PARTITION BY _source_file, order_id ORDER BY _source_row) > 1` |
 | `orders_customer_id_not_null` | Completeness | Critical | `df.customer_id.isna()` | `customer_id IS NULL` |
 | `orders_order_ts_not_null` | Completeness | Critical | `df.order_ts.isna()` | `order_ts IS NULL` |
 | `orders_order_ts_valid` | Validity | Critical | `df.order_ts.notna() & ts.isna()` with `format="%Y-%m-%d %H:%M:%S", errors="coerce"` | `order_ts IS NOT NULL AND TRY_STRPTIME(order_ts, '%Y-%m-%d %H:%M:%S') IS NULL` |
-| `orders_order_ts_not_future` | Timeliness | Critical | `ts > now` | `ts > now()` |
+| `orders_order_ts_not_future` | Timeliness | Critical | `ts > now` | `ts > getvariable('run_now')` |
 | `orders_status_allowed` | Validity | Critical | `~df.order_status.str.strip().str.upper().isin(["DELIVERED", "CANCELLED", "RETURNED"])` | `UPPER(TRIM(order_status)) NOT IN ('DELIVERED', 'CANCELLED', 'RETURNED')` |
 | `orders_payment_mode_allowed` | Validity | Warning | Mode is not already one of the 4 allowed values (it gets mapped, then loads) | `payment_mode NOT IN ('UPI', 'Card', 'Cash on Delivery', 'Wallet')` |
 | `orders_quantity_positive` | Accuracy | Critical | `qty <= 0` | `TRY_CAST(quantity AS INTEGER) <= 0` |
@@ -171,7 +230,9 @@ In the code columns, `ts`, `qty`, `price`, `disc`, `amt`, `mins`, `paid`, `mrp` 
 | `orders_delivery_minutes_max` | Accuracy | Critical | `mins >= 120` | `TRY_CAST(delivery_minutes AS DOUBLE) >= 120` |
 | `orders_product_exists` | Consistency | Critical | `~df.product_id.isin(products.product_id)` | `product_id NOT IN (SELECT product_id FROM raw_products)` |
 | `orders_store_exists` | Consistency | Critical | `~df.store_id.isin(stores.store_id)` | `store_id NOT IN (SELECT store_id FROM raw_stores)` |
-| `orders_freshness` | Timeliness | Warning | Whole file: `ts.max() < now - 1 day` | `MAX(ts) < now() - INTERVAL 1 DAY` |
+| `orders_unit_price_le_mrp` | Accuracy (distribution) | Warning | `(mrp > 0) & (price > mrp + 0.01)`, using the product's MRP | `product_mrp > 0 AND price > product_mrp + 0.01` |
+| `orders_freshness` | Timeliness | Warning | Whole file: newest non-future `ts < now - 1 day` | `MAX(order_ts) FILTER (WHERE order_ts <= run_now) < run_now - INTERVAL 1 DAY` |
+| `orders_volume` | Completeness (volume) | Warning | Whole file: rows < 10% of the median of the last 5 loads of the same file (`etl_load_history`) | Same rule, using the per-run counts in `raw_orders` |
 
 #### payments.csv
 
@@ -193,7 +254,7 @@ In the code columns, `ts`, `qty`, `price`, `disc`, `amt`, `mins`, `paid`, `mrp` 
 | `customers_phone_10_digits` | Validity | Warning | `~df.phone.fillna("").str.fullmatch(r"\d{10}")` | `NOT regexp_full_match(COALESCE(phone, ''), '\d{10}')` |
 | `customers_pincode_6_digits` | Validity | Warning | `~df.pincode.fillna("").str.fullmatch(r"\d{6}")` | `NOT regexp_full_match(COALESCE(pincode, ''), '\d{6}')` |
 | `customers_city_not_null` | Completeness | Warning | `df.city.isna()` | `city IS NULL` |
-| `customers_signup_not_future` | Timeliness | Critical | `signup > now` | `TRY_CAST(signup_date AS DATE) > current_date` |
+| `customers_signup_not_future` | Timeliness | Critical | `signup > now` | `TRY_STRPTIME(signup_date, '%Y-%m-%d') > getvariable('run_now')` |
 | `customers_tier_casing` | Consistency | Warning | `~df.loyalty_tier.isin(["Bronze", "Silver", "Gold", "Platinum"])` (then fixed with `.str.title()`) | `loyalty_tier NOT IN ('Bronze', 'Silver', 'Gold', 'Platinum')` |
 
 #### products.csv
@@ -223,7 +284,9 @@ In the code columns, `ts`, `qty`, `price`, `disc`, `amt`, `mins`, `paid`, `mrp` 
 | Consistency | ✅ | ✅ | ✅ | — | — |
 | Timeliness | ✅ | — | ✅ | — | — |
 
-**Totals:** 34 checks (25 Critical, 9 Warning).
+**Totals:** 36 checks (25 Critical, 11 Warning).
+
+I added `orders_unit_price_le_mrp` and `orders_volume` for observability Experiments 7 and 8. In clean data, `unit_price` always equals the product's MRP (all 2,196 matched orders have a ratio of exactly 1.0), and selling above MRP is illegal in India. So any price above MRP is a strong drift signal.
 
 #### Design decisions
 
@@ -253,17 +316,153 @@ Each check writes one row per run:
 
 ### 1. Ownership
 
+| Dataset | Owner (accountable for its content) | Why |
+|---|---|---|
+| `orders.csv` | Head of Operations (Kavya, COO's team) | Created by the order management system that ops runs. |
+| `payments.csv` | Finance Controller | Comes from the payment gateway; finance reconciles it. |
+| `customers.csv` | CRM / Marketing lead, with the Data Protection Officer for PII | Holds personal data, so privacy sign-off is needed. |
+| `products.csv` | Category / Merchandising manager | Sets MRP and cost price. |
+| `stores.csv` | Head of Store Operations | Opens stores and assigns zones and capacity. |
+| Warehouse tables (`etl_*`, `raw_*`, `stg_*`, `mart_*`, `dq_results`, `pipeline_runs`) | Data engineering (FDE team, then NammaMart's data owner) | Responsible for the pipeline, not the source content. |
+
+**Changing a quality rule:** the business owner of the data approves it, and data engineering implements it. For example, the 120-minute delivery limit (`orders_delivery_minutes_max`) changes the "10-minute promise" KPI, so the COO approves it. The change goes through a pull request that edits [`nammamart_dq.py`](include/nammamart_dq.py) and [`stg_orders.sql`](include/sql/stg_orders.sql) together, so both pipelines stay identical.
+
 ### 2. Data dictionary
+
+Types are as stored in DuckDB. The ELT tables `stg_orders`, `stg_customers`, `stg_products` and `stg_stores` have the same business columns, plus `dq_status`, `failure_reason`, `dq_warnings`, the `chk__*` flags and the lineage columns `_source_file` / `_source_row`.
+
+**`etl_fact_orders`**: one row per order that passed every Critical check.
+
+| Column | Type | Meaning | Source | Allowed values | PII |
+|---|---|---|---|---|---|
+| `order_id` | VARCHAR | Order key (unique) | orders.order_id | `ORD` + 6 digits | No |
+| `order_ts` | TIMESTAMP | When the order was placed (IST) | orders.order_ts | Parsed `YYYY-MM-DD HH:MM:SS`, not in the future | No |
+| `order_date` | DATE | Date part of `order_ts` | Derived | — | No |
+| `customer_id` | VARCHAR | Customer key → `etl_dim_customer` | orders.customer_id | Not null | Pseudonymous |
+| `store_id` | VARCHAR | Store key → `etl_dim_store` | orders.store_id | Exists in stores.csv | No |
+| `product_id` | VARCHAR | Product key → `etl_dim_product` | orders.product_id | Exists in products.csv | No |
+| `quantity` | BIGINT | Units ordered | orders.quantity | > 0 | No |
+| `unit_price` | DOUBLE | Price per unit, ₹ | orders.unit_price | ≤ product MRP (warning) | No |
+| `discount_pct` | BIGINT | Discount percentage | orders.discount_pct | 0–100 | No |
+| `order_amount` | DOUBLE | Amount charged, ₹ | orders.order_amount | = quantity × unit_price × (1 − discount/100), ±₹0.01 | No |
+| `payment_mode` | VARCHAR | How the customer paid | orders.payment_mode, standardised | UPI, Card, Cash on Delivery, Wallet | No |
+| `order_status` | VARCHAR | Latest order status | orders.order_status, uppercased; updated by increments | DELIVERED, CANCELLED, RETURNED | No |
+| `channel` | VARCHAR | Where the order was placed | orders.channel | App, Web | No |
+| `delivery_minutes` | DOUBLE | Minutes from order to delivery | orders.delivery_minutes | < 120; required when DELIVERED | No |
+| `net_revenue` | DOUBLE | Revenue counted for reporting, ₹ | Derived: `order_amount` if DELIVERED, else 0 | ≥ 0 | No |
+| `gross_margin` | DOUBLE | `net_revenue − quantity × cost_price`, ₹ | Derived, joined to products | Empty if the product failed its checks | No |
+| `within_15_min` | BOOLEAN | Delivered within 15 minutes | Derived from `delivery_minutes` | true/false; empty if not delivered | No |
+| `_run_id` | VARCHAR | Airflow run that loaded the row | Pipeline | — | No |
+| `_loaded_at` | TIMESTAMPTZ | When the row was loaded (UTC) | Pipeline | — | No |
+
+**`etl_dim_customer`**: one row per customer (newest copy kept).
+
+| Column | Type | Meaning | Source | Allowed values | PII |
+|---|---|---|---|---|---|
+| `customer_id` | VARCHAR | Customer key (unique) | customers.customer_id | `C` + 5 digits | Pseudonymous |
+| `email` | VARCHAR | **Masked** email | customers.email | `xx***@domain` or `***` | Yes (masked) |
+| `phone` | VARCHAR | **Masked** phone | customers.phone | `98******21` | Yes (masked) |
+| `city` | VARCHAR | City | customers.city | Bengaluru (may be empty: warning) | Indirect |
+| `area` | VARCHAR | Neighbourhood | customers.area | — | Indirect |
+| `pincode` | VARCHAR | Postal code | customers.pincode | 6 digits (warning) | Indirect |
+| `signup_date` | TIMESTAMP | Date the customer signed up | customers.signup_date | Not in the future | No |
+| `loyalty_tier` | VARCHAR | Loyalty tier | customers.loyalty_tier, title-cased | Bronze, Silver, Gold, Platinum | No |
+| `is_active` | BOOLEAN | Account is active | customers.is_active (`Y`/`N`) | true/false | No |
+
+`full_name` is deliberately not stored.
+
+**`etl_dim_product`**: one row per product.
+
+| Column | Type | Meaning | Source | Allowed values | PII |
+|---|---|---|---|---|---|
+| `product_id` | VARCHAR | Product key (unique) | products.product_id | `P` + 4 digits | No |
+| `product_name`, `brand`, `unit` | VARCHAR | Descriptive attributes | products.* | — | No |
+| `category` | VARCHAR | Category (6 values) | products.category | Not null | No |
+| `sub_category` | VARCHAR | Sub-category | products.sub_category | — | No |
+| `mrp` | DOUBLE | Maximum retail price, ₹ | products.mrp | > 0 | No |
+| `cost_price` | DOUBLE | NammaMart's cost, ₹ | products.cost_price | ≤ mrp | No |
+| `is_perishable` | BOOLEAN | Perishable item | products.is_perishable | true/false | No |
+| `launch_date` | TIMESTAMP | Launch date | products.launch_date | — | No |
+
+**`etl_dim_store`**: one row per dark store.
+
+| Column | Type | Meaning | Source | Allowed values | PII |
+|---|---|---|---|---|---|
+| `store_id` | VARCHAR | Store key (unique) | stores.store_id | `S01`–`S15` | No |
+| `store_name`, `area`, `pincode` | VARCHAR | Location details | stores.* | — | No |
+| `zone` | VARCHAR | Sales zone | stores.zone | North, South, East, West (not null) | No |
+| `open_date` | TIMESTAMP | Opening date | stores.open_date | — | No |
+| `manager_name` | VARCHAR | Store manager | stores.manager_name | — | **Yes** (employee) |
+| `capacity_orders_per_day` | BIGINT | Daily order capacity | stores.capacity_orders_per_day | > 0 (warning) | No |
 
 ### 3. Lineage
 
 ### 4. Personal data
 
+**Personal data in the dataset:**
+
+| File | Column | Personal data? | How my pipeline handles it |
+|---|---|---|---|
+| customers.csv | `full_name` | Yes, direct identifier | **Dropped** in staging and the dimension; no report needs it. `***` in quarantine. |
+| customers.csv | `email` | Yes, direct identifier | **Masked**: `priya.rao@example.com` → `pr***@example.com`. Malformed emails → `***`. |
+| customers.csv | `phone` | Yes, direct identifier | **Masked**: `9876543221` → `98******21`. |
+| customers.csv | `area`, `pincode`, `city` | Yes, indirectly (location narrows down a person) | Kept, since zone and area analytics need them; restricted to analysts. |
+| customers.csv | `customer_id`, `signup_date`, `loyalty_tier` | Pseudonymous (personal data once linked to the CRM) | Kept; it's the join key. |
+| stores.csv | `manager_name` | Yes: an employee's name | Kept in `etl_dim_store` / `stg_stores`, since ops needs it; not shown in any mart. |
+| orders.csv | `customer_id` + `order_ts` + `area` | Yes, combined (buying habits of a person) | Only aggregated in marts, except `mart_top_customers`, which shows masked email and ID only. |
+
+**Why mask instead of delete:** `customer_id` must stay to join orders to customers (top customers, loyalty tier). Partial email and phone let support staff confirm "is this the right customer?" without exposing the full value. Deleting the columns would also remove the ability to spot duplicate accounts (the same masked email twice). The full values are still available, under tighter control, in the source CRM.
+
+**Law:** India's **Digital Personal Data Protection Act, 2023 (DPDP Act)**. NammaMart is a *data fiduciary* and must:
+- Process customer data only for the purpose the customer consented to (purpose limitation).
+- Collect and keep only what's needed (data minimisation), which is why `full_name` is dropped.
+- Delete data once the purpose is served (storage limitation).
+- Protect it with reasonable security safeguards (masking, access control).
+- Report breaches to the Data Protection Board and to the affected customers.
+- Honour customers' rights to access, correct and erase their data.
+
+Penalties go up to ₹250 crore for failing to prevent a breach.
+
 ### 5. Access control
+
+| Layer | Who can read it | Why |
+|---|---|---|
+| Raw (`raw_*`, source CSVs) | Data engineering only (2–3 named people) | Holds unmasked PII and is the legal audit copy. |
+| Staging (`stg_*`, `etl_dim_*`) | Data engineering and analysts | Masked, row-level detail, needed to debug and answer new questions. |
+| Mart (`mart_*`, `etl_*` reports) | Finance, ops, store managers, leadership | Aggregated and masked; the business-facing layer. |
+| Quarantine files, `dq_results` | Data engineering and the dataset's owner | To fix bad source data. My quarantine files are masked too. |
+
+**Unmasked phone numbers in `raw_customers`:** nobody should read them in the warehouse during normal work. Support staff who need to call a customer use the CRM, which has its own access controls and audit log. Only the data engineering owner can open the raw layer, for audit or to fix a bug, and that access should be logged.
+
+**Gap in my setup:** DuckDB is a single file with no users or roles, so anyone who can open the file can read every table, raw included. In production, I would move the warehouse to PostgreSQL (or a cloud warehouse) and give each layer its own schema and role (`GRANT SELECT ON SCHEMA mart TO finance`). Until then, I excluded the file from git (see `.gitignore`).
 
 ### 6. Retention
 
+| Data | Keep for | Why | After that |
+|---|---|---|---|
+| Raw orders and payments | 8 years | Financial records: the Companies Act, 2013 requires books of account to be kept for 8 years. | Archive to cold storage, then delete. |
+| Raw customers (unmasked PII) | While the customer is active + 1 year | DPDP storage limitation: delete once the purpose is served. | Delete the row, or replace the PII columns with `NULL` and keep the `customer_id` so old orders still join. |
+| Masked customer data (`stg_customers`, `etl_dim_customer`) | Same as raw customers | It's still personal data (pseudonymous). | Rebuilt from raw, so it disappears automatically after the raw purge. |
+| Quarantine files | 90 days | Long enough for the data owner to fix the source; after that they're stale. | Automatic delete job. |
+| `dq_results`, `pipeline_runs` | 2 years | Useful as a quality trend. No PII inside. | Delete or summarise to monthly. |
+
+Today nothing is deleted automatically. A weekly retention DAG that runs these deletes would be the next step.
+
 ### 7. Secrets
+
+**Where they live:** my two DAGs need no credentials: the data is local CSVs, and the warehouse is a local DuckDB file. Any secret, such as `SLACK_WEBHOOK_URL` for alerts, goes in an **Airflow Variable** (or a Connection), read at run time inside a task:
+
+```python
+from airflow.sdk import Variable
+webhook = Variable.get("SLACK_WEBHOOK_URL", default=None)
+```
+
+The value is set in the Airflow UI (Admin → Variables) or in `airflow_settings.yaml` / `.env` for local development. Both of those files are listed in `.gitignore`, so they never reach GitHub. Airflow stores Variables in its metadata database and hides values whose names contain words like `secret`, `password` or `token` in the UI. In production they would come from a secrets backend such as AWS Secrets Manager or HashiCorp Vault.
+
+**Why never in the DAG file or on GitHub:**
+- The `dags/` folder is in the git repo, so anyone with repo access, every fork, and the whole git history would hold the secret forever. Deleting it later doesn't remove it from history.
+- Bots scan public GitHub for webhook URLs and keys within minutes. A leaked Slack webhook lets anyone post fake "pipeline OK" messages to finance.
+- Rotating the secret would mean a code change and a redeploy, instead of one edit in the UI.
 
 ### 8. Audit
 

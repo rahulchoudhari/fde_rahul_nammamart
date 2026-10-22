@@ -256,7 +256,7 @@ def nammamart_elt_rahul():
 
     # ── AUDIT: one row per run in pipeline_runs, even when something failed ───
 
-    @task(trigger_rule="all_done")
+    @task(trigger_rule="all_done", retries=0)    # retrying would write duplicate audit rows
     def audit():
         import pandas as pd
 
