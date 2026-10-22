@@ -1,7 +1,5 @@
 # NammaMart ETL & ELT Pipeline — Submission
 
-**Name:** <your name>
-**Repository:** <GitHub link>
 
 ## Part 0: Discovery and data profiling
 
@@ -91,15 +89,60 @@ Nobody will answer these, so each question has the assumption my pipeline uses.
 
 ## Part C: Scheduling
 
-**Cron expression:**
+Both DAGs use the same schedule settings:
 
-**Time shown in UTC in the Airflow UI:**
+```python
+@dag(
+    schedule="0 9 * * 1-6",                                          # 9:00 AM, Monday–Saturday
+    start_date=pendulum.datetime(2026, 10, 1, tz="Asia/Kolkata"),    # cron is read in IST, not UTC
+    catchup=False,
+    default_args={
+        "retries": 2,
+        "retry_delay": timedelta(minutes=1),
+        "execution_timeout": timedelta(minutes=10),
+    },
+)
+```
 
-**What would happen at 9 AM if `start_date` were in UTC:**
+![Schedule of both DAGs in the Airflow UI](ScheduleScreenShot.png)
 
-**What happens if the laptop or Docker is off at 9 AM:**
+**Cron expression:** `0 9 * * 1-6`
 
-**Why `catchup=False`:**
+It reads as: minute `0`, hour `9`, any day of the month, any month, days of the week `1-6` (Monday to Saturday; Sunday is `0`). Because the `start_date` has `tz="Asia/Kolkata"`, Airflow reads the cron in IST, so the run fires at **9:00 AM IST**.
+
+**Time shown in UTC in the Airflow UI:** **03:30 UTC**, because IST is UTC+5:30.
+
+My screenshot shows the next run as `2026-10-21 23:30:00`. That's not UTC: the Airflow UI shows times in the browser's timezone, and my laptop is set to US Eastern time (EDT, UTC−4). It's the same moment in three timezones:
+
+| Timezone | Next run |
+|---|---|
+| IST (Asia/Kolkata) | Thu 22 Oct 2026, 09:00 |
+| UTC (what Airflow stores) | Thu 22 Oct 2026, 03:30 |
+| EDT (my browser) | Wed 21 Oct 2026, 23:30 |
+
+So "the time in the UI" depends on who is looking. NammaMart's team should set the UI timezone to Asia/Kolkata (user menu → timezone) so nobody misreads it.
+
+**What would happen at 9 AM if `start_date` were in UTC:** Airflow would read `0 9 * * 1-6` as 9:00 AM **UTC**, which is **2:30 PM IST**. The report would arrive five hours after Kavya's 9:30 AM stand-up, which is worse than today's manual 10:30 AM email. Nothing would error or warn: the DAG would run successfully, just at the wrong time. That's why the timezone must be explicit.
+
+**What happens if the laptop or Docker is off at 9 AM:** Nothing runs. The Airflow scheduler runs inside Docker on my laptop, so if Docker is off at 9:00, no process exists to start the run. With `catchup=False`, Airflow does not go back and run the missed slot when Docker comes back. It waits for the next scheduled time. I saw this myself: I unpaused `nammamart_etl_rahul` after the 21 Oct 9:00 slot had passed, and Airflow didn't create a run for 21 Oct. The next run in the screenshot is 22 Oct. For NammaMart that means no report that morning, and nobody is told. Someone would have to notice and click **Trigger** by hand.
+
+The fix is to run Airflow on a machine that's always on (a server, or Astronomer's managed service), not a laptop. Also add an alert when the 9:00 run hasn't succeeded by 9:15.
+
+**Why `catchup=False`:** With `catchup=True`, Airflow creates a run for every missed 9:00 slot since `start_date` (1 Oct 2026). That's about 18 runs the moment the DAG is unpaused. For this pipeline, those runs would be useless:
+
+- **Each run loads the same files.** The CSVs in `include/data/nammamart/` are a snapshot, not one file per day, so 18 backfill runs would reprocess identical data 18 times.
+- **They would fight over the warehouse.** Every run writes to the same single-writer DuckDB file, so the runs would queue behind each other.
+- **The ELT raw tables would grow by 18 copies** of every file, and `dq_results` and `pipeline_runs` would fill with meaningless history.
+
+The client needs **today's** report at 9 AM, not a replay of past days. Missed days can be run on purpose with **Trigger** if ever needed.
+
+**Retries and timeouts:**
+
+| Setting | Value | Why |
+|---|---|---|
+| `retries` | 2 | Handles brief problems, like a file still being copied or the warehouse locked by the other DAG. Two retries are enough without hiding a real failure. |
+| `retry_delay` | 1 minute | Short enough that all retries finish by about 9:05, well before the 9:30 stand-up. |
+| `execution_timeout` | 10 minutes | A full run takes about 5 seconds. A task stuck for 10 minutes is broken, so it fails loudly instead of hanging past 9:30. |
 
 ## Part D: Data quality checks
 
@@ -263,3 +306,7 @@ Each check writes one row per run:
 ## Part G: Recommendation to the CTO
 
 ## Screenshots
+
+| What | File |
+|---|---|
+| Schedule showing 9:00 AM IST and the next-run time | [ScheduleScreenShot.png](ScheduleScreenShot.png) |
