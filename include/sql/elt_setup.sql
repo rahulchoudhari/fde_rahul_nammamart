@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     status            VARCHAR
 );
 
--- Same 34 checks as include/nammamart_dq.py (SUBMISSION.md Part D)
+-- Same 36 checks as include/nammamart_dq.py (SUBMISSION.md Part D)
 CREATE OR REPLACE TABLE elt_dq_catalog (check_name VARCHAR, file VARCHAR, dimension VARCHAR, severity VARCHAR);
 INSERT INTO elt_dq_catalog VALUES
     ('orders_order_id_unique',         'orders',    'Uniqueness',   'Critical'),
@@ -42,7 +42,9 @@ INSERT INTO elt_dq_catalog VALUES
     ('orders_delivery_minutes_max',    'orders',    'Accuracy',     'Critical'),
     ('orders_product_exists',          'orders',    'Consistency',  'Critical'),
     ('orders_store_exists',            'orders',    'Consistency',  'Critical'),
+    ('orders_unit_price_le_mrp',       'orders',    'Accuracy',     'Warning'),
     ('orders_freshness',               'orders',    'Timeliness',   'Warning'),
+    ('orders_volume',                  'orders',    'Completeness', 'Warning'),
     ('payments_payment_id_unique',     'payments',  'Uniqueness',   'Critical'),
     ('payments_order_exists',          'payments',  'Consistency',  'Critical'),
     ('payments_amount_positive',       'payments',  'Accuracy',     'Critical'),

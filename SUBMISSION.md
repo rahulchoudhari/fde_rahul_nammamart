@@ -102,7 +102,7 @@ extract[stores]    ──┘      └─► quarantine CSVs + dq_results        
 | `extract` ×5 | One mapped task per file, all 5 running in parallel. Reads the CSV with every column as text (`dtype=str`), so the checks see values exactly as received. |
 | `validate` | Runs the 36 checks from Part D with `run_checks()`. Rows that fail any Critical check are written to `include/quarantine/rahul/<file>_failed_<run_id>.csv` with a `failure_reason` column. Customer emails and phones are masked even in quarantine. All results go to `dq_results`. |
 | `transform` | Cleans the passed rows: trims text, uppercases statuses, maps `upi`/`cod`/`Cashh` to the allowed modes, fixes tier casing. Masks email (`pr***@example.com`) and phone (`98******21`) and drops `full_name`. Joins orders to products for `cost_price`, then derives `order_date`, `net_revenue` (DELIVERED only), `gross_margin` and `within_15_min`. |
-| `load` | Writes a star schema. The dimensions (`etl_dim_customer`, `etl_dim_product`, `etl_dim_store`) and `etl_payments` are full snapshots, replaced each run. The fact `etl_fact_orders` uses **delete-then-insert by `order_id` in one transaction**, so a re-run replaces the same rows instead of adding them, and an increment correction overwrites the old row. |
+| `load` | Writes a star schema. The dimensions (`etl_dim_customer`, `etl_dim_product`, `etl_dim_store`) and `etl_payments` are full snapshots, replaced each run. The fact `etl_fact_orders` uses **delete-then-insert by `order_id` in one transaction**, so a re-run replaces the same rows instead of adding them, and an increment correction overwrites the old row. On a full-file load, orders that now fail a check are also removed, so they can't go stale in the fact table (bug found in Part F, Exp 9). |
 | `reconcile` | Builds `etl_payment_reconciliation`: one row per mismatch, with one of 4 reasons (`DELIVERED_NOT_PAID`, `AMOUNT_MISMATCH`, `CANCELLED_BUT_PAID`, `ORDER_NOT_IN_FACT`). |
 | `report` | Builds `etl_daily_zone_revenue` and `etl_category_margin` and prints them in the log. |
 | `audit` | `trigger_rule="all_done"`, so it runs even after a failure. It writes one row to `pipeline_runs`, then fails on purpose if the run failed, so the run stays red. |
@@ -294,7 +294,7 @@ I added `orders_unit_price_le_mrp` and `orders_volume` for observability Experim
 2. **Duplicates keep one copy.** The first copy loads (for customers, the newest by `signup_date`). Only the extra copies are quarantined, so a real order is never lost.
 3. **Key checks use the full master file.** `orders_product_exists` checks the product IDs in `products.csv` as received, not just the clean ones. So if a product is quarantined (for example P0109, negative MRP), its real orders still count toward revenue. Only the product's own details are missing.
 4. **Payment mismatches are reported, not rejected.** Finance needs to see them, so they go into the reconciliation table instead of quarantine.
-5. **`orders_freshness` will warn on every run of this dataset.** The data ends on 30 September, so the latest order is always more than 1 day old. This is the correct result, and it's useful evidence for observability Experiment 9.
+5. **`orders_freshness` ignores future-dated rows,** otherwise one 2027 typo would make stale data look fresh. Even so, Experiment 9 showed that two typo-dated orders (`2026-10-21 10:15`) make the September export look fresh once that date has passed. See Part F.
 
 #### dq_results columns
 
@@ -397,6 +397,39 @@ Types are as stored in DuckDB. The ELT tables `stg_orders`, `stg_customers`, `st
 
 ### 3. Lineage
 
+**The number:** `mart_daily_store_kpis` says store **S01 (Hebbal) earned ₹4,583.05 on 15 Sep 2026** from 6 delivered orders.
+
+**Tracing it in ELT** takes three queries and gives the exact CSV line:
+
+```sql
+-- 1. The mart row
+SELECT order_date, store_id, delivered_orders, net_revenue FROM mart_daily_store_kpis
+WHERE order_date = DATE '2026-09-15' AND store_id = 'S01';                 -- 6 orders, ₹4,583.05
+
+-- 2. The staging rows behind it, with where each one came from
+SELECT order_id, order_status, net_revenue, _source_file, _source_row, _run_id
+FROM stg_orders WHERE order_date = DATE '2026-09-15' AND store_id = 'S01' AND dq_status = 'PASSED';
+
+-- 3. Any row exactly as received
+SELECT * FROM raw_orders WHERE _run_id = 'final_full' AND _source_row = 1723;
+```
+
+| order_id | status | net_revenue | _source_file | _source_row (CSV line) |
+|---|---|---|---|---|
+| ORD001127 | DELIVERED | 597.55 | orders.csv | 88 (line 89) |
+| ORD001105 | DELIVERED | 360.00 | orders.csv | 390 (line 391) |
+| ORD001130 | DELIVERED | 447.30 | orders.csv | 750 (line 751) |
+| ORD001144 | DELIVERED | 354.00 | orders.csv | 1498 (line 1499) |
+| ORD001133 | DELIVERED | 2,325.60 | orders.csv | 1723 (line 1724) |
+| ORD001132 | DELIVERED | 498.60 | orders.csv | 2191 (line 2192) |
+| ORD001109 | RETURNED | 0.00 | orders.csv | 2358 (line 2359) |
+
+The 6 delivered amounts add up to ₹4,583.05. Each row tells me the file, the line (`_source_row` + 1 for the header) and the Airflow run that loaded it.
+
+**In ETL** I can only get part of the way. `etl_fact_orders` has `order_id` and `_run_id`, so I can list the 6 orders. But the fact table doesn't record which file the row came from (`orders.csv` or an increment) or which line. I have to search the CSV for each `order_id` by hand. If a row was overwritten by an increment, the old version is gone from the warehouse.
+
+**ELT is easier**, because raw keeps every row as received, staging keeps `_source_file` / `_source_row` / `_run_id` on every row, and the marts are plain SQL over staging. Lineage is just a few joins. The ETL throws that information away in pandas before loading.
+
 ### 4. Personal data
 
 **Personal data in the dataset:**
@@ -466,46 +499,308 @@ The value is set in the Airflow UI (Admin → Variables) or in `airflow_settings
 
 ### 8. Audit
 
+**The rejected order:** `ORD000469`, quantity 0 on a DELIVERED order.
+
+**ELT**: three queries, all inside the warehouse:
+
+```sql
+-- As received (raw keeps every load; this order has been loaded 9 times, all identical)
+SELECT * FROM raw_orders WHERE order_id = 'ORD000469' ORDER BY _loaded_at LIMIT 1;
+-- order_ts 2026-09-07 11:52:46 | C00076 | S02 | P0041 | quantity 0 | unit_price 444.0 | order_amount 0.0 | DELIVERED | orders.csv row 126
+
+-- The rule it broke
+SELECT order_id, dq_status, failure_reason FROM stg_orders WHERE order_id = 'ORD000469';
+-- FAILED | orders_quantity_positive
+
+-- Proof it's not in the CFO's revenue: marts only read PASSED rows
+SELECT COUNT(*) FROM stg_orders WHERE order_id = 'ORD000469' AND dq_status = 'PASSED';   -- 0
+```
+
+**ETL**: the evidence is spread across three places:
+
+1. *As received:* the source file `include/data/nammamart/orders.csv`, line 127. The warehouse doesn't keep raw rows.
+2. *Rule broken:* the quarantine file `include/quarantine/rahul/orders_failed_final2_full.csv` has the row with `failure_reason = orders_quantity_positive`.
+3. *Proof:* `SELECT COUNT(*) FROM etl_fact_orders WHERE order_id = 'ORD000469'` returns **0**. The fact table is the only source of `etl_daily_zone_revenue`.
+
+Both pipelines can prove it, but **ELT does it in one place with SQL**, and its raw copy can't be edited after the fact. The ETL's "as received" evidence is a CSV on disk that someone could change or delete, and the quarantine file is a separate file per run.
+
 ### 9. Change history
+
+**Example from the data:** `ORD000271` was DELIVERED on **4 Sep** (₹445) and is RETURNED in the 1 Oct increment. (No corrected order is dated exactly 3 Sep; the 10 corrections are dated 1–25 Sep.)
+
+**What each pipeline shows for September after the increment:**
+
+| | ETL | ELT |
+|---|---|---|
+| ORD000271 | RETURNED, net_revenue 0 | RETURNED, net_revenue 0 |
+| September net revenue | ₹11,31,435.10 | ₹11,31,435.10 |
+| Before the increment | ₹11,35,628.60 | ₹11,35,628.60 |
+
+Both pipelines **restate September**, lowering it by ₹4,193.70 (the 10 returns). The old DELIVERED version is gone from `etl_fact_orders`; the ETL simply overwrote it.
+
+I found a worse problem in testing. If the ETL re-runs `orders.csv` after the increment, the 10 orders go back to DELIVERED and September goes back up. During my experiments the ETL total was ₹4,193.70 higher than the ELT for exactly this reason. The ELT doesn't do this, because it re-applies the MERGE after every staging rebuild.
+
+**What finance wants:** books for September are closed. Finance needs September **as reported** (₹11,35,628.60) to stay fixed, and the return booked as a **negative ₹445 in October**, the month it happened. Ops may still want the restated view, "which September orders were eventually returned?"
+
+**Keeping both views:**
+- **ELT already has the data.** `raw_orders` keeps both versions of ORD000271: the `orders.csv` load (DELIVERED) and the increment load (RETURNED), each with `_loaded_at`. "As reported" is a query over the latest `orders.csv` load:
+  ```sql
+  SELECT SUM(net_revenue) FROM v_orders_checked
+  WHERE _source_file = 'orders.csv' AND dq_status = 'PASSED' AND order_date < DATE '2026-10-01';   -- ₹11,35,628.60
+  ```
+  "Restated" is `stg_orders` (₹11,31,435.10).
+- **The proper fix** is an order status history table (SCD Type 2): one row per order per status, with `valid_from` / `valid_to`. Plus a returns fact that books each return as a negative amount on its return date. Then September's report stays fixed, October shows −₹4,193.70, and any past date can be queried "as of".
+- **ETL can't do this** without new tables, because it keeps only the latest version of each order.
 
 ## Part F: Observability tests
 
-| # | Experiment | Expected | Observed | Where I saw it | What I would change |
+**Run audit:** both DAGs end with an `audit` task (`trigger_rule="all_done"`, `retries=0`) that writes one row per run to `pipeline_runs`: `run_id`, `dag_id`, `start_time`, `end_time`, `rows_extracted`, `rows_loaded`, `rows_quarantined` and `status`.
+
+**How I ran the experiments:** each experiment triggered **both DAGs at the same time** through the scheduler, with a readable run ID (`exp01_happy` … `exp09_freshness`), so every run is in the Airflow UI history. Test files were made from a backup of the originals, and every source file was restored and checksum-verified after each experiment. Run date: 22 Oct 2026, around 07:40 IST.
+
+| # | Experiment | Expected | Observed (ETL / ELT) | Where I saw it | What I would change |
 |---|---|---|---|---|---|
-| 1 | Happy path | | | | |
-| 2 | Re-run (idempotency) | | | | |
-| 3 | Incremental load | | | | |
-| 4 | Missing source file | | | | |
-| 5 | New bad data | | | | |
-| 6 | Schema change | | | | |
-| 7 | Volume anomaly | | | | |
-| 8 | Distribution drift | | | | |
-| 9 | Freshness | | | | |
-| 10 | Recovery | | | | |
+| 1 | Happy path | Both green; 5 extracts in parallel | Both green. ETL 11.3 s, ELT 7.5 s. All 5 `extract` tasks started within 0.03 s of each other in both DAGs. Same counts in both: orders 2,412 in / 2,312 passed / 100 quarantined, payments 2,228 / 2,206 / 22, customers 405 / 397 / 8, products 152 / 142 / 10, stores 15 / 14 / 1. ETL `validate` took 5.4 s because it **waited for the ELT's lock** on the shared DuckDB file. | Grid view (start times); `validate` log: `[Warehouse] locked by another run, retry 1/60 in 5s`; `pipeline_runs` | Stagger the schedules (ETL 9:00, ELT 9:02) or give each pipeline its own warehouse file, so neither waits. |
+| 2 | Re-run (idempotency) | Fact counts unchanged; ELT raw grows | `etl_fact_orders` 2,312 → 2,312; `stg_orders` 2,412 → 2,412; revenue unchanged. `raw_orders` 7,236 → 9,648 and `raw_payments` 6,684 → 8,912: **raw grew by one full copy. That's correct:** raw is an append-only record of every load, and staging only reads the latest load of each file. | Row-count query before/after; `load` log `0 inserted, 2312 replaced` | Skip loading a file into raw if the same file (same checksum) was already loaded, so raw doesn't grow on every re-run. |
+| 3 | Incremental load | 150 inserted, 10 updated, no duplicates | ETL: `2312 → 2462 rows (150 inserted, 10 replaced/updated)`. ELT MERGE: `2412 → 2562 rows (150 inserted, 10 updated)`. All 10 corrected orders are RETURNED in both, 1 row each. | `load` / `merge_increments` logs; query on the 10 IDs | ETL: a later full re-run of `orders.csv` **reverts the 10 returns** (observed: after Exp 5 the ETL total was ₹4,193.70 above ELT). Needs an order-history table, like the ELT's raw layer. |
+| 4 | Missing source file | Extract fails after retries; nothing loaded | Both: `extract[products]` failed with `FileNotFoundError: … products.csv`. 3 tries about a minute apart (02:11, 02:12, 02:13 UTC; 1-minute retry delay), then `failed`. The other 4 extracts succeeded; every downstream task `upstream_failed`. `audit` still ran and wrote `FAILED`, `rows_extracted` 5,060, `rows_loaded` 0. **Nothing alerted me**: the run just turned red in the UI. **Bug found:** `audit` raises on purpose to keep the run red, so it was retried twice and wrote **3 duplicate rows**. | Grid view (orange `up_for_retry`, then red); task log; `pipeline_runs` | Fixed: `audit` now has `retries=0`. Add an `on_failure_callback` that posts to Slack, with the webhook in an Airflow Variable. |
+| 5 | New bad data | Each of the 5 rows quarantined with the right reason | Both pipelines, identical: ORD900001 → `orders_customer_id_not_null`, ORD900002 → `orders_quantity_positive`, ORD900003 → `orders_store_exists`, ORD900004 (`SHIPPED`) → `orders_status_allowed`, ORD900005 (2027) → `orders_order_ts_not_future`. `dq_results` counted +1 on each check (18→19, 10→11, 5→6, 3→4, 5→6). 0 of them reached `etl_fact_orders` or a PASSED staging row. Runs stayed green. | `orders_failed_exp05_bad_rows.csv`; `stg_orders.failure_reason`; `dq_results` | Alert when a Critical check fails more rows than usual (e.g. above the average of the last 5 runs), not only on a crash. |
+| 6 | Schema change (`order_amount` → `total`) | Fail loudly, load nothing | **ETL:** extract succeeded (it reads any columns). `validate` failed with `AttributeError: 'DataFrame' object has no attribute 'order_amount'` after 3 tries (~2 min): loud, but the message is confusing. **ELT:** `extract[orders]` failed with `ValueError: Schema change in orders.csv: missing ['order_amount'], unexpected ['total']`, before anything was loaded. Neither loaded wrong data. | Grid view; task logs | Add the same header check to the ETL `extract`. Raise `AirflowFailException` for schema errors so they fail at once instead of retrying a problem that can't fix itself. |
+| 7 | Volume anomaly (50 orders) | Something warns about a >90% drop | Both: new check `orders_volume` = **WARN** (50 < 10% of the median 2,412). **Both runs stayed green.** ETL: the fact table kept its old rows, so the **report didn't change at all**: the drop was invisible. ELT: staging was rebuilt from the 50-row file, so **mart revenue fell from ₹12,12,267 to ₹1,03,134 (−91%)**. Side effect: ~2,150 payments failed `payments_order_exists` (their orders were missing), so `rows_quarantined` jumped to 2,192 / 2,201. | `dq_results`; `pipeline_runs`; mart totals | Make `orders_volume` **Critical**: stop the run before the marts are rebuilt, and alert. A 91% revenue drop must never reach the 9:30 stand-up. |
+| 8 | Distribution drift (`unit_price` × 100 for S08) | A check catches it; store metric moves | Both: `orders_amount_formula` FAIL on 194 rows (18 normal + all 176 S08 rows), and the new `orders_unit_price_le_mrp` WARN on 175. **ETL:** S08 revenue stayed at ₹79,130.50: the fact still held the previous good S08 rows, so the report was silently stale. **ELT:** S08 revenue fell **₹78,980.50 → ₹6,569.90** (only its 1-Oct increment orders left), and East zone fell ₹3,14,056.20 → ₹2,41,645.60 (−23%). | `dq_results`; `mart_daily_store_kpis` vs `etl_fact_orders` | Fixed the ETL stale rows: a full-file load now also deletes orders that fail their checks (found the same bug in Exp 9). Add a per-store revenue check against its own 7-day average. |
+| 9 | Freshness (latest order 30 days old) | Timeliness check warns | Both: `orders_freshness` = **WARN**; runs green. Surprise: on the **normal** data it said **PASS**. ORD001089 and ORD001693 are dated `2026-10-21 10:15` inside a September export. On 21 Oct they were "future" and quarantined. From 22 Oct they pass every check, count as October revenue and make the data look fresh. **Bug found:** the shift made 2 future-dated orders valid; when the original file came back they failed again, but the ETL **kept them in the fact table** (2,464 vs ELT 2,462, +₹637.40). | `dq_results`; staging query; ETL vs ELT row counts | Fixed the stale rows (see 8). Add a rule that `order_ts` must fall inside the export's period. Measure freshness from the file's arrival time, not the newest timestamp in it. |
+| 10 | Recovery (Clear after Exp 4) | Only the failed task and its downstream re-run | **ETL:** restored `products.csv`, ran `airflow tasks clear -f -d` (only failed + downstream). Only `extract[products]` (try 4) and the tasks after it re-ran; the other 4 extracts stayed at try 1. Run → success, and `audit` added a SUCCESS row. **ELT:** cleared from the UI on the whole `extract` task, so **all 5** extracts re-ran (try 2). Also succeeded. | Grid view try numbers; `task_instance` table; `pipeline_runs` | Write a runbook: fix the cause, then **Clear → "Only failed"** on the failed task, not on the whole task or the whole run. |
+
+After the experiments I ran both DAGs on the original files (full, then increment). The ETL and ELT match exactly: **2,462 orders, ₹12,12,267.10 total, ₹11,31,435.10 for September.**
 
 ### Five pillars of observability
 
 | Pillar | How my pipeline covers it | Strength |
 |---|---|---|
-| Freshness | | |
-| Volume | | |
-| Schema | | |
-| Distribution | | |
-| Lineage | | |
+| Freshness | `orders_freshness` (newest valid order < 1 day old) in `dq_results`; `pipeline_runs.end_time` shows when data last landed. | **Weakest.** Two typo-dated orders fooled it (Exp 9); it's only a Warning, and nobody is alerted if the 9:00 run never happens (Part C). |
+| Volume | `orders_volume` (< 10% of the usual rows); `rows_extracted` / `rows_loaded` / `rows_quarantined` per run in `pipeline_runs`. | Medium. Caught the 50-row file, but only as a Warning, so a −91% report still went out (Exp 7). Only `orders` is checked. |
+| Schema | ELT `extract` compares each header with the expected columns and fails before loading; ETL fails later on a missing column. | **Best (ELT).** Loud, early and with a clear message (Exp 6). The ETL is loud but unclear. |
+| Distribution | `orders_amount_formula`, `orders_unit_price_le_mrp`, delivery-time and discount ranges. | Medium. Caught the ×100 price drift (Exp 8), but there's no statistical check per store or day. |
+| Lineage | ELT: `_source_file`, `_source_row` and `_run_id` on every raw and staging row, traceable to the exact CSV line (Part E.3). ETL: `_run_id` and `order_id` only. | Strong in ELT, weak in ETL. |
+
+**Overall:** schema is the pillar my pipelines cover best, and freshness the weakest. The biggest gap across all pillars is **alerting**. Every warning lands in `dq_results`, but a person has to go and look. The first thing I would add is a Slack alert for any FAIL, any WARN on volume, freshness or distribution, and any failed run.
 
 ## Business questions
 
-1. Daily net revenue by zone and by store
-2. Revenue and gross margin by product category
-3. Average delivery time per store, and % delivered within 15 minutes
-4. Revenue by payment mode, and total amount not reconciled with the gateway
-5. Top 10 customers by spend, with loyalty tier
-6. Rows rejected today, by file and by reason
+Results are from the final runs: September plus the 1 October increment. **Every answer is identical in the ETL and ELT pipelines**, so each table below is both pipelines' result. Store S07 shows as `Unknown` because its zone is empty in `stores.csv`, so the store failed `stores_zone_not_null`. Its orders still count.
+
+### 1. Daily net revenue by zone and by store
+
+```sql
+-- ETL
+SELECT order_date, zone, delivered_orders, net_revenue FROM etl_daily_zone_revenue ORDER BY order_date, zone;
+SELECT f.order_date, f.store_id, s.store_name, SUM(f.net_revenue) AS net_revenue
+FROM etl_fact_orders f LEFT JOIN etl_dim_store s USING (store_id)
+WHERE f.order_status = 'DELIVERED' GROUP BY ALL ORDER BY 1, 2;
+
+-- ELT (one table answers both)
+SELECT order_date, zone, store_id, store_name, delivered_orders, net_revenue
+FROM mart_daily_store_kpis ORDER BY order_date, zone, store_id;
+```
+
+The daily tables have 450 rows (30 days × 15 stores), so here are the totals by zone, plus one example day:
+
+| Zone | Delivered orders | Net revenue (₹) |
+|---|---|---|
+| East | 611 | 3,14,056.20 |
+| West | 592 | 3,12,413.00 |
+| South | 433 | 2,56,214.55 |
+| North | 443 | 2,44,008.40 |
+| Unknown (S07) | 151 | 85,574.95 |
+| **Total** | **2,230** | **12,12,267.10** |
+
+Top stores: S06 Banashankari ₹94,256.85, S13 Malleshwaram ₹89,650.30, S05 JP Nagar ₹86,163.65, S07 BTM Layout ₹85,574.95, S01 Hebbal ₹85,510.70.
+
+Example day, 15 Sep 2026: S01 ₹4,583.05 (6 orders), S09 ₹3,549.00 (6), S11 ₹2,470.80 (6), S02 ₹1,630.30 (3), S10 ₹1,578.30 (4), S08 ₹984.50 (3).
+
+### 2. Revenue and gross margin by product category
+
+```sql
+SELECT * FROM etl_category_margin;      -- ETL
+SELECT * FROM mart_category_margin;     -- ELT
+```
+
+| Category | Delivered orders | Net revenue (₹) | Gross margin (₹) | Margin % |
+|---|---|---|---|---|
+| Staples | 302 | 2,68,583.30 | 67,143.14 | 25.0 |
+| Household | 363 | 2,12,105.05 | 54,466.15 | 25.7 |
+| Personal Care | 323 | 2,10,889.10 | 47,054.58 | 22.3 |
+| Dairy & Bakery | 406 | 1,80,555.80 | 47,746.13 | 26.4 |
+| Snacks & Beverages | 342 | 1,75,181.55 | 41,484.71 | 23.7 |
+| Fruits & Vegetables | 374 | 93,604.20 | 22,205.38 | 23.7 |
+| Unknown | 120 | 71,348.10 | — | — |
+
+"Unknown" is orders whose product failed its checks (empty category, negative MRP or cost above MRP), so their margin can't be trusted. Their revenue still counts.
+
+### 3. Average delivery time per store, and % delivered within 15 minutes
+
+```sql
+-- ETL
+SELECT store_id, ROUND(AVG(delivery_minutes), 1) AS avg_min,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE within_15_min) / COUNT(*), 1) AS pct_within_15
+FROM etl_fact_orders WHERE order_status = 'DELIVERED' GROUP BY 1 ORDER BY 3 DESC;
+-- ELT
+SELECT * FROM mart_delivery_sla ORDER BY pct_within_15_min DESC;
+```
+
+| Store | Avg minutes | % within 15 min | | Store | Avg minutes | % within 15 min |
+|---|---|---|---|---|---|---|
+| S08 Whitefield | 20.6 | 35.4 | | S04 Jayanagar | 21.3 | 27.5 |
+| S07 BTM Layout | 21.1 | 32.5 | | S13 Malleshwaram | 21.9 | 27.3 |
+| S01 Hebbal | 20.5 | 32.2 | | S09 Indiranagar | 21.1 | 26.5 |
+| S02 Yelahanka | 20.9 | 31.3 | | S10 Marathahalli | 22.1 | 26.0 |
+| S14 Vijayanagar | 21.5 | 31.3 | | S12 Rajajinagar | 21.8 | 24.4 |
+| S05 JP Nagar | 21.2 | 29.6 | | S15 Basaveshwaranagar | 22.0 | 22.9 |
+| S03 RT Nagar | 20.6 | 29.2 | | S06 Banashankari | 22.5 | 21.6 |
+| S11 HSR Layout | 20.8 | 28.6 | | **All stores** | **21.3** | **28.5** |
+
+On average a delivery takes 21 minutes, and **only 28.5% of orders arrive within 15 minutes**, far from the "10-minute promise". This is the number Kavya most needs to see.
+
+### 4. Revenue by payment mode, and the amount that doesn't reconcile
+
+```sql
+-- ETL
+SELECT payment_mode, COUNT(*) AS delivered_orders, SUM(net_revenue) AS net_revenue
+FROM etl_fact_orders WHERE order_status = 'DELIVERED' GROUP BY 1;
+SELECT reason, COUNT(*), SUM(ABS(COALESCE(difference, amount_paid))) FROM etl_payment_reconciliation GROUP BY 1;
+-- ELT (one table)
+SELECT * FROM mart_payment_mode_revenue;
+```
+
+| Payment mode | Delivered orders | Net revenue (₹) | Mismatches | Unreconciled (₹) |
+|---|---|---|---|---|
+| UPI | 1,207 | 6,39,931.95 | 123 | 80,995.73 |
+| Card | 457 | 2,51,882.30 | 81 | 41,303.50 |
+| Cash on Delivery | 320 | 1,82,334.40 | 63 | 57,533.55 |
+| Wallet | 246 | 1,38,118.45 | 43 | 21,984.15 |
+
+| Reconciliation reason | Rows | Amount (₹) |
+|---|---|---|
+| `DELIVERED_NOT_PAID`: delivered, no successful payment | 220 (70 in Sep, 150 Oct orders with no payment file yet) | 1,22,095.75 |
+| `ORDER_NOT_IN_FACT`: payment for an order that was rejected | 77 | 79,036.18 |
+| `AMOUNT_MISMATCH`: paid amount ≠ order amount | 13 | 685.00 |
+| **Total that doesn't reconcile** | **310** | **₹2,01,816.93** |
+
+Of the 70 September orders, **42 were delivered although the payment FAILED**, and 28 have no payment record at all.
+
+### 5. Top 10 customers by spend, with loyalty tier
+
+```sql
+-- ETL
+SELECT f.customer_id, c.loyalty_tier, c.email, COUNT(*) AS orders, SUM(f.net_revenue) AS total_spend
+FROM etl_fact_orders f LEFT JOIN etl_dim_customer c USING (customer_id)
+WHERE f.order_status = 'DELIVERED' GROUP BY ALL ORDER BY total_spend DESC LIMIT 10;
+-- ELT
+SELECT * FROM mart_top_customers;
+```
+
+| Rank | Customer | Tier | Email (masked) | Orders | Spend (₹) |
+|---|---|---|---|---|---|
+| 1 | C00136 | Bronze | sa***@example.com | 9 | 8,738.10 |
+| 2 | C00115 | Bronze | sa***@example.com | 8 | 8,037.70 |
+| 3 | C00283 | Bronze | ni***@example.com | 8 | 7,934.60 |
+| 4 | C00236 | Platinum | sn***@example.com | 12 | 7,831.80 |
+| 5 | C00310 | Bronze | ki***@example | 8 | 7,258.95 |
+| 6 | C00265 | Gold | vi***@example.com | 8 | 7,151.30 |
+| 7 | C00071 | Silver | ma***@example.com | 11 | 6,933.30 |
+| 8 | C00338 | Silver | bh***@example.com | 9 | 6,848.55 |
+| 9 | C00357 | Bronze | ar***@example.com | 11 | 6,637.90 |
+| 10 | C00209 | Platinum | ka***@example.com | 8 | 6,519.40 |
+
+No raw email or phone appears. Insight: **4 of the top 5 spenders are only Bronze**, so the loyalty tiers don't reflect spend.
+
+### 6. Rows rejected today, by file and by reason
+
+```sql
+-- ETL: from the quality scorecard for the latest run
+SELECT split_part(check_name, '_', 1) || '.csv' AS file, check_name AS reason, rows_failed
+FROM dq_results
+WHERE run_id = (SELECT run_id FROM pipeline_runs WHERE dag_id = 'nammamart_etl_rahul' ORDER BY end_time DESC LIMIT 1)
+  AND dag_id = 'nammamart_etl_rahul' AND severity = 'Critical' AND rows_failed > 0;
+-- ELT
+SELECT file, reason, rows_rejected FROM mart_rejected_rows;
+```
+
+Result for the full September run (identical in both pipelines). A row that broke two rules counts under both reasons, so these add up to more than the 141 rows rejected:
+
+| File | Reason | Rows |
+|---|---|---|
+| orders.csv | orders_customer_id_not_null | 18 |
+| orders.csv | orders_amount_formula | 18 |
+| orders.csv | orders_order_id_unique | 12 |
+| orders.csv | orders_quantity_positive | 10 |
+| orders.csv | orders_product_exists | 9 |
+| orders.csv | orders_delivered_has_minutes | 8 |
+| orders.csv | orders_delivery_minutes_max | 6 |
+| orders.csv | orders_order_ts_valid | 5 |
+| orders.csv | orders_order_ts_not_future | 5 |
+| orders.csv | orders_store_exists | 5 |
+| orders.csv | orders_status_allowed | 3 |
+| orders.csv | orders_discount_range | 3 |
+| orders.csv | orders_order_ts_not_null | 1 |
+| payments.csv | payments_amount_positive | 10 |
+| payments.csv | payments_order_exists | 8 |
+| payments.csv | payments_payment_id_unique | 4 |
+| customers.csv | customers_id_unique | 5 |
+| customers.csv | customers_signup_not_future | 3 |
+| products.csv | products_cost_le_mrp | 5 |
+| products.csv | products_category_not_null | 3 |
+| products.csv | products_id_unique | 2 |
+| products.csv | products_mrp_positive | 1 |
+| stores.csv | stores_zone_not_null | 1 |
+
+On the increment run, the 160 increment orders were all clean, so `mart_rejected_rows` shows only the master files for that run.
 
 ## Part G: Recommendation to the CTO
+
+**To:** Sameer, CTO, NammaMart Quick Commerce
+**From:** Rahul, FDE team
+**Re:** ETL or ELT for the 9:00 AM operations report
+
+**Recommendation: adopt ELT, with an ETL-style quality gate in front of the reports.**
+
+I ran both pipelines side by side on the same September data, the 1 October file and 10 deliberate failure tests. Both produce identical numbers (₹11,31,435.10 net revenue for September after returns), and both keep every bad row out of the reporting tables. The difference is what happens around those numbers.
+
+**Auditability: ELT clearly wins.** ELT keeps every row exactly as received (`raw_*`), and every reported number traces to a file, line and run in three SQL queries. When finance asks "show me rejected order ORD000469 as received, the rule it broke, and prove it's not in revenue", ELT answers in one place. ETL needs the source CSV, a quarantine file and a warehouse query, and the "as received" copy is a file anyone could edit.
+
+**Data quality guarantee: equal, by design.** Finance's requirement, "no bad row on the CFO's dashboard", holds in both. In ELT the marts read only `dq_status = 'PASSED'` rows, the same gate the ETL applies before loading. Both use the same 36 checks, and all 5 bad rows I injected were rejected for the right reason by both pipelines.
+
+**Correctness over time: ELT was right in situations where ETL was wrong.** In testing, the ETL:
+- **Reverted the 10 returns** when `orders.csv` was re-run after the 1 Oct file, putting September back up by ₹4,193.70.
+- **Kept 2 orders that later failed their checks**, worth ₹637.40, until I fixed it.
+- **Kept showing yesterday's figures for store S08** after its prices were corrupted.
+
+ELT rebuilds staging from raw every run, so it can't drift like this. The ETL needs extra code for each of these cases, and I fixed one of them.
+
+**Ease of change: ELT.** Every transformation is a short SQL file in `include/sql/`. A new question means a new mart, and because raw is kept, it can be answered for past data immediately. In the ETL, a new rule or column means changing Python and re-sending files, and old raw data is gone.
+
+**Performance at 1000× (about 2.4 million orders a month): ELT.** The ETL loads all five files into pandas in memory and passes them between tasks; at 1000× that means gigabytes of memory per run. ELT pushes the work into the database engine. DuckDB handles tens of millions of rows on a laptop, and the same SQL moves to PostgreSQL, BigQuery or Snowflake later. Two changes will be needed at scale: load only new files (today a re-run appends a full copy to raw), and build staging incrementally instead of rebuilding it.
+
+**Cost: similar today, ELT costs more storage later.** Both run on free, open-source tools on one machine. ELT stores every raw load, so storage grows over time, but storage is the cheapest part of a data platform, and it's what buys the audit trail compliance asked for. With file de-duplication and a retention policy (8 years for financial raw data, Part E.6), it stays small.
+
+**When ETL would be the better choice:** if raw data must not be stored at all, for example raw customer PII, ETL's "clean before storing" is safer. That's why my ELT masks PII in staging and keeps raw access to data engineering only.
+
+**Top 3 risks of the recommended ELT design:**
+
+1. **Raw holds unmasked personal data.** `raw_customers` has real emails and phone numbers. DuckDB has no user permissions, so anyone with the file can read them. This is a DPDP Act exposure. *Mitigation:* move to a warehouse with role-based access (raw readable only by data engineering), keep the file out of git (done), and add a retention job that deletes PII after the customer leaves.
+2. **Bad data can still reach the 9:30 meeting with a green run.** In Experiment 7, a file with only 50 orders produced a −91% revenue report, and the run stayed green with only a warning. *Mitigation:* make volume, freshness and per-store drift checks Critical so the marts aren't rebuilt, and alert the on-call person on Slack.
+3. **It runs on one laptop.** If Docker or the laptop is off at 9:00, there's simply no report, and nobody is told (Part C). *Mitigation:* run Airflow on an always-on server or Astronomer, and add a "report not ready by 9:15" alert.
+
+**Next step:** I suggest a two-week pilot. ELT runs daily at 9:00 IST alongside the current Excel report, and finance signs off when the numbers match for 10 working days in a row.
 
 ## Screenshots
 
 | What | File |
 |---|---|
 | Schedule showing 9:00 AM IST and the next-run time | [ScheduleScreenShot.png](ScheduleScreenShot.png) |
+| ETL DAG, Graph view, green run (`final2_full`) | `screenshots/etl_graph.png` |
+| ELT DAG, Graph view, green run (`final_full`) | `screenshots/elt_graph.png` |
+| A quarantine file (`include/quarantine/rahul/orders_failed_final2_full.csv`) | `screenshots/quarantine_file.png` |
+| `dq_results` query result | `screenshots/dq_results.png` |
+| `pipeline_runs` query result | `screenshots/pipeline_runs.png` |
+| Payment reconciliation table (`etl_payment_reconciliation` / `mart_payment_reconciliation`) | `screenshots/reconciliation.png` |

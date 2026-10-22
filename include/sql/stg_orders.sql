@@ -4,7 +4,7 @@
 -- v_orders_checked holds the latest load of EVERY orders file (orders.csv and each increment).
 -- stg_orders is rebuilt from orders.csv only; stg_orders_merge.sql then upserts the increments.
 -- Checks read the raw text (exactly as received); output columns are the cleaned values.
--- Uses session variable: run_now (IST timestamp of this run).
+-- Uses session variable: run_now (IST timestamp of this run; falls back to the current IST time).
 
 CREATE OR REPLACE VIEW v_orders_checked AS
 WITH latest AS (
@@ -12,7 +12,13 @@ WITH latest AS (
     QUALIFY _loaded_at = MAX(_loaded_at) OVER (PARTITION BY _source_file)
 ),
 latest_products AS (
-    SELECT product_id FROM raw_products QUALIFY _loaded_at = MAX(_loaded_at) OVER ()
+    SELECT product_id, TRY_CAST(mrp AS DOUBLE) AS mrp, _source_row
+    FROM raw_products QUALIFY _loaded_at = MAX(_loaded_at) OVER ()
+),
+-- One MRP per product (first copy), for the price check
+product_mrp AS (
+    SELECT product_id, mrp FROM latest_products
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY _source_row) = 1
 ),
 latest_stores AS (
     SELECT store_id FROM raw_stores QUALIFY _loaded_at = MAX(_loaded_at) OVER ()
@@ -25,7 +31,8 @@ typed AS (
         TRY_CAST(discount_pct AS DOUBLE)             AS disc,
         TRY_CAST(order_amount AS DOUBLE)             AS amt,
         TRY_CAST(delivery_minutes AS DOUBLE)         AS mins,
-        UPPER(TRIM(order_status))                    AS status_clean
+        UPPER(TRIM(order_status))                    AS status_clean,
+        (SELECT mrp FROM product_mrp p WHERE p.product_id = latest.product_id) AS product_mrp
     FROM latest
 ),
 checked AS (
@@ -35,7 +42,9 @@ checked AS (
         customer_id IS NULL                                                 AS chk__orders_customer_id_not_null,
         order_ts IS NULL                                                    AS chk__orders_order_ts_not_null,
         order_ts IS NOT NULL AND ts IS NULL                                 AS chk__orders_order_ts_valid,
-        COALESCE(ts > getvariable('run_now'), FALSE)                        AS chk__orders_order_ts_not_future,
+        -- run_now is set by the DAG; ad-hoc queries (e.g. from VS Code) fall back to the current IST time
+        COALESCE(ts > COALESCE(getvariable('run_now'), timezone('Asia/Kolkata', now())), FALSE)
+                                                                            AS chk__orders_order_ts_not_future,
         NOT COALESCE(status_clean IN ('DELIVERED', 'CANCELLED', 'RETURNED'), FALSE)
                                                                             AS chk__orders_status_allowed,
         NOT COALESCE(payment_mode IN ('UPI', 'Card', 'Cash on Delivery', 'Wallet'), FALSE)
@@ -50,7 +59,9 @@ checked AS (
         NOT COALESCE(product_id IN (SELECT product_id FROM latest_products), FALSE)
                                                                             AS chk__orders_product_exists,
         NOT COALESCE(store_id IN (SELECT store_id FROM latest_stores), FALSE)
-                                                                            AS chk__orders_store_exists
+                                                                            AS chk__orders_store_exists,
+        -- Selling above MRP is illegal in India; in clean data unit_price always equals MRP
+        COALESCE(product_mrp > 0 AND price > product_mrp + 0.01, FALSE)     AS chk__orders_unit_price_le_mrp
     FROM typed
 ),
 flagged AS (
@@ -72,7 +83,8 @@ flagged AS (
             CASE WHEN chk__orders_store_exists          THEN 'orders_store_exists' END
         ), '') AS failure_reason,
         NULLIF(concat_ws('; ',
-            CASE WHEN chk__orders_payment_mode_allowed  THEN 'orders_payment_mode_allowed' END
+            CASE WHEN chk__orders_payment_mode_allowed  THEN 'orders_payment_mode_allowed' END,
+            CASE WHEN chk__orders_unit_price_le_mrp     THEN 'orders_unit_price_le_mrp' END
         ), '') AS dq_warnings
     FROM checked
 )

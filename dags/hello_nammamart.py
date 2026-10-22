@@ -10,6 +10,7 @@ DATA = "/usr/local/airflow/include/data/nammamart"
     schedule=None,
     start_date=pendulum.datetime(2026, 7, 1, tz="UTC"),
     catchup=False,
+    default_args={"retries": 2},      # the project's DAG tests require retries=2
     tags=["Rahul_test"]
 )
 

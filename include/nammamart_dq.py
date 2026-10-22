@@ -13,7 +13,8 @@ Usage from a DAG task:
 
 `ctx` holds what checks need beyond the file itself:
     ctx = {"now": pd.Timestamp(...), "orders": raw_orders_df,
-           "products": raw_products_df, "stores": raw_stores_df}
+           "products": raw_products_df, "stores": raw_stores_df,
+           "orders_history_rows": [rows in the last 5 loads of this orders file]}
 """
 
 from dataclasses import dataclass
@@ -88,6 +89,19 @@ def _orders_freshness(df, ctx):
     return pd.Series(stale, index=df.index)
 
 
+def _orders_unit_price_le_mrp(df, ctx):
+    # Selling above MRP is illegal in India; in clean data unit_price always equals MRP
+    mrp = num(df.product_id.map(ctx["products"].drop_duplicates("product_id").set_index("product_id").mrp))
+    return (mrp > 0) & (num(df.unit_price) > mrp + 0.01)
+
+
+def _orders_volume(df, ctx):
+    # Fewer than 10% of the usual rows for this file (median of the last 5 loads) → warn
+    history = ctx.get("orders_history_rows") or []
+    dropped = bool(history) and len(df) < 0.1 * pd.Series(history).median()
+    return pd.Series(dropped, index=df.index)
+
+
 def _payments_amount_matches_order(df, ctx):
     order_amount = ctx["orders"].drop_duplicates("order_id").set_index("order_id").order_amount
     expected = num(df.order_id.map(order_amount))
@@ -129,7 +143,9 @@ CHECKS = [
           lambda df, ctx: ~df.product_id.isin(ctx["products"].product_id)),
     Check("orders_store_exists", "orders", "Consistency", "Critical",
           lambda df, ctx: ~df.store_id.isin(ctx["stores"].store_id)),
+    Check("orders_unit_price_le_mrp", "orders", "Accuracy", "Warning", _orders_unit_price_le_mrp),
     Check("orders_freshness", "orders", "Timeliness", "Warning", _orders_freshness, table_level=True),
+    Check("orders_volume", "orders", "Completeness", "Warning", _orders_volume, table_level=True),
 
     # payments.csv
     Check("payments_payment_id_unique", "payments", "Uniqueness", "Critical",
